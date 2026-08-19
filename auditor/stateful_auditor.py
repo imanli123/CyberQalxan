@@ -1,23 +1,30 @@
 from __future__ import annotations
-import json
+import getpass
+import logging
 import random
 import sys
 import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set
 
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import settings
-from common.models import AuditReport, SentinelBlock, SIEMQueryRange
-from common.crypto import compute_micro_roots, compute_super_root
+from common.crypto import bucket_size_for, build_micro_roots, build_super_root, parse_timestamp
+from common.models import AuditReport, LogEntry, SentinelBlock, SIEMQueryRange
+from integrations.base_siem import SIEMIntegration
+from integrations.factory import load_siem_integration
+
+logger = logging.getLogger("cyberqalxan.auditor")
 
 
 class ThreeTierScheduler:
+    """Vanguard (1-min), 24h sweep, and 30d random spot-checks."""
+
     def __init__(self, max_concurrent: int = settings.AUDITOR_MAX_CONCURRENT_THREADS):
         self.semaphore = threading.Semaphore(max_concurrent)
         self._running = False
@@ -65,117 +72,103 @@ class ThreeTierScheduler:
 
 
 class SIEM_Puller:
-    def __init__(
-        self,
-        base_url: str = settings.SIEM_API_BASE_URL,
-        username: str = settings.SIEM_API_USERNAME,
-        password: str = settings.SIEM_API_PASSWORD,
-    ):
-        self.base_url = base_url
-        self.auth = (username, password)
+    def __init__(self, integration: SIEMIntegration):
+        self.integration = integration
 
-    def pull_logs(self, start_time: str, end_time: str) -> List[str]:
-        try:
-            resp = requests.get(
-                f"{self.base_url}/api/v1/alerts",
-                params={
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "limit": 10000,
-                },
-                auth=self.auth,
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list):
-                    return [json.dumps(item) for item in data]
-                hits = data.get("hits", {}).get("hits", []) if isinstance(data, dict) else []
-                return [json.dumps(h["_source"]) for h in hits]
-        except Exception:
-            pass
-        return []
+    def pull_logs(self, start_time: str, end_time: str) -> Optional[List[LogEntry]]:
+        return self.integration.fetch_historical_logs(start_time, end_time)
 
 
 class LedgerReader:
     def __init__(self, node_ips: List[str] = settings.SENTINEL_NODE_IPS):
         self.node_ips = node_ips
 
-    def fetch_block(self, block_id: str) -> Optional[SentinelBlock]:
-        node = random.choice(self.node_ips)
-        try:
-            resp = requests.get(
-                f"http://{node}:{settings.SENTINEL_API_PORT}/block/{block_id}",
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                return SentinelBlock(**resp.json())
-        except Exception:
-            pass
-        return None
-
     def fetch_blocks_by_timeframe(self, start: str, end: str) -> List[SentinelBlock]:
-        node = random.choice(self.node_ips)
-        try:
-            resp = requests.get(
-                f"http://{node}:{settings.SENTINEL_API_PORT}/blocks",
-                params={"start": start, "end": end},
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                return [SentinelBlock(**b) for b in resp.json()]
-        except Exception:
-            pass
+        for node in random.sample(self.node_ips, min(3, len(self.node_ips))):
+            try:
+                resp = requests.get(
+                    f"http://{node}:{settings.SENTINEL_API_PORT}/blocks",
+                    params={"start": start, "end": end},
+                    timeout=5,
+                )
+                if resp.status_code == 200:
+                    return [SentinelBlock(**b) for b in resp.json()]
+            except Exception:
+                continue
         return []
 
 
 class VerificationEngine:
     @staticmethod
-    def verify(siem_logs: List[str], ledger_block: SentinelBlock) -> Tuple[bool, List[str]]:
-        micro_root_count = len(ledger_block.payload.micro_roots)
+    def verify(siem_logs: List[LogEntry], ledger_block: SentinelBlock):
+        """Rebuild the Oracle's micro-roots for the block's minute and compare.
 
-        if not siem_logs:
-            return False, ["no-siem-logs"]
+        Returns (passed, tampered_window_labels).
+        """
+        timer_enum = ledger_block.payload.timer_enum
+        stored = ledger_block.payload.micro_roots
+        recovered = build_micro_roots(siem_logs, timer_enum)
 
-        chunk_size = max(1, len(siem_logs) // max(micro_root_count, 1))
-        buckets = [
-            siem_logs[i : i + chunk_size]
-            for i in range(0, len(siem_logs), chunk_size)
-        ]
+        mismatched: List[int] = []
+        for i in range(min(len(recovered), len(stored))):
+            if recovered[i] != stored[i]:
+                mismatched.append(i)
+        if len(recovered) != len(stored):
+            mismatched.extend(range(min(len(recovered), len(stored)), max(len(recovered), len(stored))))
 
-        recovered_micro_roots = compute_micro_roots(buckets)
-        mismatched: List[str] = []
+        recovered_super = build_super_root(recovered)
+        passed = recovered_super == ledger_block.payload.super_root and not mismatched
+        windows = VerificationEngine._window_labels(ledger_block, sorted(set(mismatched)))
+        return passed, windows
 
-        for i in range(min(len(recovered_micro_roots), len(ledger_block.payload.micro_roots))):
-            if recovered_micro_roots[i] != ledger_block.payload.micro_roots[i]:
-                mismatched.append(f"micro_root_{i}")
-
-        recovered_super_root = compute_super_root(recovered_micro_roots)
-        passed = (
-            recovered_super_root == ledger_block.payload.super_root
-            and not mismatched
-        )
-
-        return passed, mismatched
+    @staticmethod
+    def _window_labels(block: SentinelBlock, indices: List[int]) -> List[str]:
+        start = parse_timestamp(block.payload.timestamp)
+        if start is None:
+            return [f"bucket_{i}" for i in indices]
+        size = bucket_size_for(block.payload.timer_enum)
+        labels = []
+        for i in indices:
+            ws = start + timedelta(seconds=i * size)
+            we = ws + timedelta(seconds=size)
+            labels.append(f"{ws:%Y-%m-%dT%H:%M:%S} - {we:%Y-%m-%dT%H:%M:%S}")
+        return labels
 
 
 class AlertManager:
-    @staticmethod
-    def trigger(report: AuditReport):
-        payload = {
-            "labels": {"alert": "cyberqalxan_integrity_failure"},
-            "annotations": {
-                "summary": "Log integrity violation detected",
-                "timeframe": report.timeframe.model_dump_json(),
-                "mismatched_windows": ",".join(report.mismatched_windows),
+    def __init__(self, integration: SIEMIntegration, username: Optional[str] = None):
+        self.integration = integration
+        self.username = username or getpass.getuser()
+
+    def trigger(self, report: AuditReport):
+        doc = {
+            "rule": {
+                "id": "900001",
+                "level": 12,
+                "description": "Log integrity violation detected by CyberQalxan",
+            },
+            "data": {
+                "timeframe_start": report.timeframe.start_time,
+                "timeframe_end": report.timeframe.end_time,
+                "tampered_windows": report.mismatched_windows,
                 "recovered_root": report.recovered_root or "",
                 "stored_root": report.stored_root or "",
+                "reported_by": self.username,
             },
         }
+        self.integration.trigger_alert(doc)
         try:
             requests.post(
                 settings.ALERT_WEBHOOK_URL,
-                json=payload,
+                json={
+                    "labels": {"alert": "cyberqalxan_integrity_failure"},
+                    "annotations": {
+                        "summary": "Log integrity violation detected",
+                        "timeframe": report.timeframe.model_dump_json(),
+                        "tampered_windows": ",".join(report.mismatched_windows),
+                        "reported_by": self.username,
+                    },
+                },
                 headers={"Content-Type": "application/json"},
                 timeout=5,
             )
@@ -185,32 +178,79 @@ class AlertManager:
 
 class AuditDaemon:
     def __init__(self):
+        self.integration = load_siem_integration()
         self.scheduler = ThreeTierScheduler()
-        self.siem_puller = SIEM_Puller()
+        self.siem_puller = SIEM_Puller(self.integration)
         self.ledger_reader = LedgerReader()
         self.verifier = VerificationEngine()
-        self.alert_manager = AlertManager()
+        self.alert_manager = AlertManager(self.integration)
+        self._lock = threading.Lock()
+        self._inflight: Set[str] = set()
+        self._alerted: Dict[str, float] = {}
+
+    def _claim_block(self, block_id: str) -> bool:
+        with self._lock:
+            now = time.time()
+            stale = [bid for bid, ts in self._alerted.items()
+                     if now - ts > settings.AUDITOR_ALERT_DEDUP_WINDOW_SECONDS]
+            for bid in stale:
+                del self._alerted[bid]
+            if block_id in self._alerted or block_id in self._inflight:
+                return False
+            self._inflight.add(block_id)
+            return True
+
+    def _finish_block(self, block_id: str, alerted: bool):
+        with self._lock:
+            self._inflight.discard(block_id)
+            if alerted:
+                self._alerted[block_id] = time.time()
+
+    @staticmethod
+    def _filter_logs_for_block(logs: List[LogEntry], block: SentinelBlock) -> List[LogEntry]:
+        start = parse_timestamp(block.payload.timestamp)
+        if start is None:
+            return []
+        end = start + timedelta(minutes=1)
+        filtered = []
+        for log in logs:
+            ts = parse_timestamp(log.timestamp)
+            if ts is None:
+                continue
+            if start <= ts < end:
+                filtered.append(log)
+        return filtered
 
     def _audit_window(self, start: str, end: str):
-        siem_logs = self.siem_puller.pull_logs(start, end)
-        ledger_blocks = self.ledger_reader.fetch_blocks_by_timeframe(start, end)
-
-        if not ledger_blocks:
+        logs = self.siem_puller.pull_logs(start, end)
+        if logs is None:
+            logger.warning("SIEM unreachable for %s..%s; skipping audit (no false alarm)", start, end)
             return
 
-        for block in ledger_blocks:
-            passed, mismatched = self.verifier.verify(siem_logs, block)
-            report = AuditReport(
-                timeframe=SIEMQueryRange(start_time=start, end_time=end),
-                passed=passed,
-                mismatched_windows=mismatched,
-                recovered_root=compute_super_root(
-                    compute_micro_roots([siem_logs])
-                ) if siem_logs else None,
-                stored_root=block.payload.super_root,
-            )
-            if not passed:
-                self.alert_manager.trigger(report)
+        blocks = self.ledger_reader.fetch_blocks_by_timeframe(start, end)
+        for block in blocks:
+            if not self._claim_block(block.block_id):
+                continue
+            alerted = False
+            try:
+                block_logs = self._filter_logs_for_block(logs, block)
+                passed, windows = self.verifier.verify(block_logs, block)
+                if not passed:
+                    recovered_root = (
+                        build_super_root(build_micro_roots(block_logs, block.payload.timer_enum))
+                        if block_logs else None
+                    )
+                    report = AuditReport(
+                        timeframe=SIEMQueryRange(start_time=start, end_time=end),
+                        passed=False,
+                        mismatched_windows=windows,
+                        recovered_root=recovered_root,
+                        stored_root=block.payload.super_root,
+                    )
+                    self.alert_manager.trigger(report)
+                    alerted = True
+            finally:
+                self._finish_block(block.block_id, alerted)
 
     def run(self):
         self.scheduler.start(
